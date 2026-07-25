@@ -151,6 +151,7 @@ class ALOHADataset(Dataset):
         history_spacing_factor: int = 12,
         num_duplicates_per_image: int = 8,
         return_value_function_returns: bool = False,
+        p_world_model: float = 0.5,
         gamma: float = 0.998,
         lazy_video_decompression: bool = False,
         rollout_data_dir: str = "",
@@ -211,6 +212,9 @@ class ALOHADataset(Dataset):
         self.history_spacing_factor = history_spacing_factor
         self.num_duplicates_per_image = num_duplicates_per_image
         self.return_value_function_returns = return_value_function_returns
+        if not 0.0 <= p_world_model <= 1.0:
+            raise ValueError(f"p_world_model must be in [0, 1], got {p_world_model}")
+        self.p_world_model = p_world_model
         self.gamma = gamma
         self.lazy_video_decompression = lazy_video_decompression
         self.rollout_data_dir = rollout_data_dir
@@ -263,6 +267,18 @@ class ALOHADataset(Dataset):
                 # Load actions and proprio (non-image data)
                 actions = f["action"][:]  # (episode_len, action_dim=14), float32
                 proprio = f["observations/qpos"][:]  # (episode_len, proprio_dim=14), float32
+                action_dim_mask = (
+                    f["action_dim_mask"][:].astype(np.float32)
+                    if "action_dim_mask" in f
+                    else np.ones(actions.shape[1], dtype=np.float32)
+                )
+                if action_dim_mask.ndim != 1 or action_dim_mask.shape[0] != actions.shape[1]:
+                    raise ValueError(f"{file}: action_dim_mask must have shape ({actions.shape[1]},)")
+                if not np.any(action_dim_mask) or not np.all(np.isin(action_dim_mask, (0.0, 1.0))):
+                    raise ValueError(f"{file}: action_dim_mask must be non-empty binary availability")
+                task_description = f.attrs.get("task_description")
+                if isinstance(task_description, bytes):
+                    task_description = task_description.decode("utf-8")
 
                 if not use_mp4:
                     # Load raw images from HDF5
@@ -307,22 +323,25 @@ class ALOHADataset(Dataset):
                 # Compute language instruction
                 # NOTE: We just hardcode based on the file path for now. Ideally, the demo files would
                 #       contain the task description as a string that we extract.
-                raw_file_string = file.split("/")[-3]
-                if "fold_shirt" in raw_file_string:
-                    raw_file_string = "fold_shirt"
-                elif "candies_in_bowl" in raw_file_string:
-                    raw_file_string = "put_candies_in_bowl"
-                elif "candy_in_bag" in raw_file_string:
-                    raw_file_string = "put_candy_in_bag"
-                elif "flatten_shirt" in raw_file_string:
-                    raw_file_string = "flatten_shirt"
-                elif "brown_chicken_wing_on_plate" in raw_file_string:
-                    raw_file_string = "put_brown_chicken_wing_on_plate"
-                elif "purple_eggplant_on_plate" in raw_file_string:
-                    raw_file_string = "put_purple_eggplant_on_plate"
+                if task_description:
+                    command = str(task_description)
                 else:
-                    raise ValueError(f"Unknown command: {raw_file_string}")
-                command = raw_file_string.replace("_", " ")
+                    raw_file_string = file.split("/")[-3]
+                    if "fold_shirt" in raw_file_string:
+                        raw_file_string = "fold_shirt"
+                    elif "candies_in_bowl" in raw_file_string:
+                        raw_file_string = "put_candies_in_bowl"
+                    elif "candy_in_bag" in raw_file_string:
+                        raw_file_string = "put_candy_in_bag"
+                    elif "flatten_shirt" in raw_file_string:
+                        raw_file_string = "flatten_shirt"
+                    elif "brown_chicken_wing_on_plate" in raw_file_string:
+                        raw_file_string = "put_brown_chicken_wing_on_plate"
+                    elif "purple_eggplant_on_plate" in raw_file_string:
+                        raw_file_string = "put_purple_eggplant_on_plate"
+                    else:
+                        raise ValueError(f"Unknown command: {raw_file_string}")
+                    command = raw_file_string.replace("_", " ")
                 self.unique_commands.add(command)
                 num_steps = episode_num_steps
                 # Add value function returns if applicable
@@ -333,6 +352,7 @@ class ALOHADataset(Dataset):
                     file_path=file,
                     proprio=proprio,
                     actions=actions,
+                    action_dim_mask=action_dim_mask,
                     command=command,
                     num_steps=num_steps,
                     returns=returns.copy() if self.return_value_function_returns else None,
@@ -410,6 +430,7 @@ class ALOHADataset(Dataset):
                     right_wrist_images=episode_data.get("right_wrist_images"),
                     proprio=episode_data["proprio"],
                     actions=episode_data["actions"],
+                    action_dim_mask=episode_data["action_dim_mask"],
                     command=episode_data["command"],
                     num_steps=episode_data["num_steps"],
                     is_lazy_video=episode_data.get("is_lazy_video", False),
@@ -598,6 +619,7 @@ class ALOHADataset(Dataset):
                         right_wrist_images=episode_data.get("right_wrist_images"),
                         proprio=episode_data["proprio"],
                         actions=episode_data["actions"],
+                        action_dim_mask=episode_data["action_dim_mask"],
                         command=episode_data["command"],
                         num_steps=int(episode_data["num_steps"]),
                         is_lazy_video=episode_data.get("is_lazy_video", False),
@@ -754,8 +776,7 @@ class ALOHADataset(Dataset):
         is_value_function_sample = False
         if sample_type != "demo":
             if self.return_value_function_returns:
-                p_world_model = 0.5
-                if np.random.rand() < p_world_model:
+                if np.random.rand() < self.p_world_model:
                     is_world_model_sample = True
                     is_value_function_sample = False
                 else:
@@ -1043,6 +1064,7 @@ class ALOHADataset(Dataset):
             chunk_size=self.chunk_size,
             num_steps=episode_data["num_steps"],
         )
+        action_dim_mask = np.broadcast_to(episode_data["action_dim_mask"], action_chunk.shape).copy()
 
         t_prev = time.time()
 
@@ -1092,6 +1114,7 @@ class ALOHADataset(Dataset):
             "video": all_images,
             "command": episode_data["command"],
             "actions": action_chunk,
+            "action_dim_mask": action_dim_mask,
             "t5_text_embeddings": torch.squeeze(self.t5_text_embeddings[episode_data["command"]]),
             "t5_text_mask": torch.ones(512, dtype=torch.int64),
             "fps": 16,
